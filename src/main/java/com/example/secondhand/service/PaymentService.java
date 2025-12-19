@@ -1,0 +1,1163 @@
+package com.example.secondhand.service;
+
+import com.alipay.api.AlipayApiException;
+import com.alipay.api.AlipayClient;
+import com.alipay.api.request.AlipayTradePagePayRequest;
+import com.alipay.api.request.AlipayTradeQueryRequest;
+import com.alipay.api.response.AlipayTradeQueryResponse;
+import com.example.secondhand.entity.Order;
+import com.example.secondhand.entity.PaymentOrder;
+import com.example.secondhand.entity.PaymentLog;
+import com.example.secondhand.entity.Product;
+import com.example.secondhand.entity.TimeoutTask;
+import com.example.secondhand.entity.OrderItem;
+import com.example.secondhand.repository.OrderRepository;
+import com.example.secondhand.repository.PaymentOrderRepository;
+import com.example.secondhand.repository.PaymentLogRepository;
+import com.example.secondhand.repository.ProductRepository;
+import com.example.secondhand.repository.OrderItemRepository;
+import com.alibaba.fastjson.JSON;
+import com.example.secondhand.event.PaymentSuccessEvent;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * 支付服务
+ * 处理支付相关的业务逻辑
+ */
+@Service
+@Transactional
+public class PaymentService {
+
+    @Autowired
+    private AlipayClient alipayClient;
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Autowired
+    private PaymentOrderRepository paymentOrderRepository;
+
+    @Autowired
+    private PaymentLogRepository paymentLogRepository;
+
+    @Autowired
+    private ProductRepository productRepository;
+
+    @Autowired
+    private OrderItemRepository orderItemRepository;
+
+    @Autowired
+    private InventoryService inventoryService;
+
+    @Autowired
+    private ApplicationEventPublisher eventPublisher;
+
+
+
+
+    /**
+     * 发起支付宝支付
+     * @param orderNo 订单号
+     * @param userId 用户ID
+     * @param returnUrl 同步回调地址
+     * @param notifyUrl 异步回调地址
+     * @return 支付表单HTML
+     */
+    public String initiateAlipayPayment(String orderNo, Long userId, String returnUrl, String notifyUrl) {
+        long startTime = System.currentTimeMillis();
+        PaymentLog log = null;
+        
+        try {
+            // 1. 验证订单存在且属于当前用户
+            Order order = orderRepository.findByOrderNo(orderNo)
+                    .orElseThrow(() -> new RuntimeException("订单不存在"));
+            
+            if (!order.getBuyerId().equals(userId)) {
+                throw new RuntimeException("无权限支付此订单");
+            }
+
+            // 2. 验证订单状态
+            if (order.getStatus() != Order.OrderStatus.PENDING_PAYMENT) {
+                throw new RuntimeException("订单状态不允许支付，当前状态：" + order.getStatus().getDescription());
+            }
+
+            // 🔥 注释掉库存验证：订单创建时已经预扣库存，支付时不需要重复检查
+            // 3. 验证库存
+            // validateInventory(orderNo);
+
+            // 4. 检查是否已存在支付订单
+            Optional<PaymentOrder> existingPayment = paymentOrderRepository.findById(orderNo);
+            PaymentOrder paymentOrder;
+            
+            if (existingPayment.isPresent()) {
+                paymentOrder = existingPayment.get();
+                // 如果已支付，不能重复支付
+                if (paymentOrder.isPaid()) {
+                    throw new RuntimeException("订单已支付，无需重复支付");
+                }
+                // 如果是其他状态，可以重新支付
+                if (paymentOrder.canTransitionTo(PaymentOrder.PaymentStatus.PENDING)) {
+                    paymentOrder.transitionTo(PaymentOrder.PaymentStatus.PENDING);
+                }
+            } else {
+                // 创建新的支付订单
+                String subject = generatePaymentSubject(orderNo);
+                String body = generatePaymentBody(orderNo);
+                
+                paymentOrder = new PaymentOrder(
+                    orderNo,
+                    order.getTotalAmount(),
+                    order.getBuyerId(),
+                    order.getBuyerName(),
+                    subject,
+                    body
+                );
+                paymentOrder = paymentOrderRepository.save(paymentOrder);
+            }
+
+            // 5. 创建支付宝支付请求
+            AlipayTradePagePayRequest request = new AlipayTradePagePayRequest();
+            request.setReturnUrl(returnUrl);
+            request.setNotifyUrl(notifyUrl);
+
+            // 6. 设置业务参数
+            Map<String, Object> bizContent = new HashMap<>();
+            bizContent.put("out_trade_no", orderNo);
+            bizContent.put("product_code", "FAST_INSTANT_TRADE_PAY");
+            bizContent.put("total_amount", paymentOrder.getAmount().toString());
+            bizContent.put("subject", paymentOrder.getSubject());
+            bizContent.put("body", paymentOrder.getBody());
+            bizContent.put("timeout_express", paymentOrder.getTimeoutExpress());
+
+            request.setBizContent(JSON.toJSONString(bizContent));
+
+            // 7. 生成支付表单
+            String paymentForm = alipayClient.pageExecute(request).getBody();
+
+            // 8. 记录支付发起日志
+            log = PaymentLog.info(orderNo, PaymentLog.LogOperation.PAYMENT_INIT, 
+                "支付发起成功，金额：" + paymentOrder.getAmount())
+                .withContext(userId, null, null)
+                .withExecutionTime(startTime);
+            log.setRequestData(JSON.toJSONString(bizContent));
+            paymentLogRepository.save(log);
+
+            return paymentForm;
+
+        } catch (AlipayApiException e) {
+            // 记录支付宝API异常
+            log = PaymentLog.error(orderNo, PaymentLog.LogOperation.PAYMENT_INIT, e)
+                .withContext(userId, null, null)
+                .withExecutionTime(startTime);
+            paymentLogRepository.save(log);
+            throw new RuntimeException("支付宝接口调用失败：" + e.getMessage(), e);
+            
+        } catch (Exception e) {
+            // 记录其他异常
+            log = PaymentLog.error(orderNo, PaymentLog.LogOperation.PAYMENT_INIT, e)
+                .withContext(userId, null, null)
+                .withExecutionTime(startTime);
+            paymentLogRepository.save(log);
+            throw e;
+        }
+    }
+
+    /**
+     * 验证订单库存
+     * @param orderNo 订单号
+     */
+    private void validateInventory(String orderNo) {
+        List<OrderItem> orderItems = orderItemRepository.findByOrderOrderNo(orderNo);
+        
+        for (OrderItem item : orderItems) {
+            Product product = productRepository.findById(item.getProductId())
+                    .orElseThrow(() -> new RuntimeException("商品不存在：" + item.getProductName()));
+            
+            // 检查商品状态
+            if (product.getStatus() != 1) {
+                throw new RuntimeException("商品已下架：" + product.getName());
+            }
+            
+            // 检查库存
+            if (product.getQuantity() < item.getQuantity()) {
+                throw new RuntimeException("商品库存不足：" + product.getName() + 
+                    "，需要：" + item.getQuantity() + "，库存：" + product.getQuantity());
+            }
+        }
+    }
+
+    /**
+     * 生成支付标题
+     * @param orderNo 订单号
+     * @return 支付标题
+     */
+    private String generatePaymentSubject(String orderNo) {
+        List<OrderItem> orderItems = orderItemRepository.findByOrderOrderNo(orderNo);
+        
+        if (orderItems.isEmpty()) {
+            return "二手商品支付";
+        }
+        
+        if (orderItems.size() == 1) {
+            return orderItems.get(0).getProductName();
+        }
+        
+        return orderItems.get(0).getProductName() + "等" + orderItems.size() + "件商品";
+    }
+
+    /**
+     * 生成支付描述
+     * @param orderNo 订单号
+     * @return 支付描述
+     */
+    private String generatePaymentBody(String orderNo) {
+        List<OrderItem> orderItems = orderItemRepository.findByOrderOrderNo(orderNo);
+        
+        StringBuilder body = new StringBuilder("二手商品交易：");
+        for (int i = 0; i < Math.min(orderItems.size(), 3); i++) {
+            if (i > 0) {
+                body.append("、");
+            }
+            OrderItem item = orderItems.get(i);
+            body.append(item.getProductName()).append("×").append(item.getQuantity());
+        }
+        
+        if (orderItems.size() > 3) {
+            body.append("等").append(orderItems.size()).append("件商品");
+        }
+        
+        return body.toString();
+    }
+
+    /**
+     * 查询支付状态
+     * @param orderNo 订单号
+     * @return 支付订单
+     */
+    @Transactional(readOnly = true)
+    public Optional<PaymentOrder> getPaymentStatus(String orderNo) {
+        return paymentOrderRepository.findById(orderNo);
+    }
+
+    /**
+     * 主动查询支付宝交易状态
+     * @param orderNo 订单号
+     * @return 支付宝查询结果
+     */
+    public AlipayTradeQueryResponse queryAlipayTradeStatus(String orderNo) {
+        long startTime = System.currentTimeMillis();
+        PaymentLog log = null;
+        
+        try {
+            AlipayTradeQueryRequest request = new AlipayTradeQueryRequest();
+            
+            Map<String, Object> bizContent = new HashMap<>();
+            bizContent.put("out_trade_no", orderNo);
+            request.setBizContent(JSON.toJSONString(bizContent));
+            
+            AlipayTradeQueryResponse response = alipayClient.execute(request);
+            
+            // 记录查询日志
+            log = PaymentLog.info(orderNo, PaymentLog.LogOperation.PAYMENT_QUERY, 
+                "支付状态查询成功")
+                .withExecutionTime(startTime);
+            log.setRequestData(JSON.toJSONString(bizContent));
+            log.setResponseData(JSON.toJSONString(response));
+            paymentLogRepository.save(log);
+            
+            // 🔥 关键修复：根据查询结果同步本地状态
+            if (response.isSuccess()) {
+                String tradeStatus = response.getTradeStatus();
+                if ("TRADE_SUCCESS".equals(tradeStatus) || "TRADE_FINISHED".equals(tradeStatus)) {
+                    // 支付成功，同步本地状态
+                    syncLocalPaymentStatus(orderNo, response.getTradeNo(), tradeStatus);
+                }
+            }
+            
+            return response;
+            
+        } catch (AlipayApiException e) {
+            log = PaymentLog.error(orderNo, PaymentLog.LogOperation.PAYMENT_QUERY, e)
+                .withExecutionTime(startTime);
+            paymentLogRepository.save(log);
+            throw new RuntimeException("查询支付状态失败：" + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 同步本地支付状态
+     * @param orderNo 订单号
+     * @param alipayTradeNo 支付宝交易号
+     * @param tradeStatus 交易状态
+     */
+    private void syncLocalPaymentStatus(String orderNo, String alipayTradeNo, String tradeStatus) {
+        try {
+            // 获取支付订单
+            Optional<PaymentOrder> paymentOrderOpt = paymentOrderRepository.findById(orderNo);
+            if (paymentOrderOpt.isEmpty()) {
+                return; // 支付订单不存在，跳过
+            }
+            
+            PaymentOrder paymentOrder = paymentOrderOpt.get();
+            
+            // 如果已经是已支付状态，跳过
+            if (paymentOrder.isPaid()) {
+                return;
+            }
+            
+            // 更新支付订单状态
+            paymentOrder.setAlipayTradeNo(alipayTradeNo);
+            if (paymentOrder.canTransitionTo(PaymentOrder.PaymentStatus.PAID)) {
+                paymentOrder.transitionTo(PaymentOrder.PaymentStatus.PAID);
+                paymentOrderRepository.save(paymentOrder);
+                
+                // 确认库存扣减
+                inventoryService.confirmInventory(orderNo);
+                
+                // 🔥 关键修复：更新订单状态时检查当前状态，防止被超时任务覆盖
+                Order order = orderRepository.findByOrderNo(orderNo).orElse(null);
+                if (order != null) {
+                    // 只有在待付款状态时才更新为待发货，如果已经是已取消状态则恢复
+                    if (order.getStatus() == Order.OrderStatus.PENDING_PAYMENT || 
+                        order.getStatus() == Order.OrderStatus.CANCELLED) {
+                        order.setStatus(Order.OrderStatus.PENDING_SHIPMENT);
+                        orderRepository.save(order);
+                        
+                        // 🔥 支付成功后发布事件，取消订单超时任务，防止竞态条件
+                        publishPaymentSuccessEvent(orderNo, alipayTradeNo, tradeStatus);
+                        
+                        // 记录状态同步日志
+                        PaymentLog.info(orderNo, PaymentLog.LogOperation.STATUS_UPDATE, 
+                            "主动查询发现支付成功，已同步订单状态为待发货，并取消超时任务")
+                            .withAlipayTradeNo(alipayTradeNo);
+                    }
+                }
+            }
+            
+        } catch (Exception e) {
+            // 记录错误但不抛出异常，避免影响查询结果返回
+            PaymentLog.error(orderNo, PaymentLog.LogOperation.STATUS_UPDATE, e)
+                .withAlipayTradeNo(alipayTradeNo);
+        }
+    }
+
+    /**
+     * 发布支付成功事件，取消订单超时任务
+     * @param orderNo 订单号
+     * @param alipayTradeNo 支付宝交易号
+     * @param tradeStatus 交易状态
+     */
+    private void publishPaymentSuccessEvent(String orderNo, String alipayTradeNo, String tradeStatus) {
+        try {
+            PaymentSuccessEvent event = new PaymentSuccessEvent(this, orderNo, alipayTradeNo, tradeStatus);
+            eventPublisher.publishEvent(event);
+            
+            PaymentLog.info(orderNo, PaymentLog.LogOperation.STATUS_UPDATE, 
+                "支付成功事件已发布，将取消订单超时任务")
+                .withAlipayTradeNo(alipayTradeNo);
+        } catch (Exception e) {
+            // 记录错误但不抛出异常
+            PaymentLog.warn(orderNo, PaymentLog.LogOperation.STATUS_UPDATE, 
+                "发布支付成功事件失败: " + e.getMessage())
+                .withAlipayTradeNo(alipayTradeNo);
+        }
+    }
+
+    /**
+     * 取消支付
+     * @param orderNo 订单号
+     * @param userId 用户ID
+     */
+    public void cancelPayment(String orderNo, Long userId) {
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            // 验证权限
+            Order order = orderRepository.findByOrderNo(orderNo)
+                    .orElseThrow(() -> new RuntimeException("订单不存在"));
+            
+            if (!order.getBuyerId().equals(userId)) {
+                throw new RuntimeException("无权限操作此订单");
+            }
+            
+            // 更新支付订单状态
+            Optional<PaymentOrder> paymentOrderOpt = paymentOrderRepository.findById(orderNo);
+            if (paymentOrderOpt.isPresent()) {
+                PaymentOrder paymentOrder = paymentOrderOpt.get();
+                if (paymentOrder.canCancel()) {
+                    paymentOrder.transitionTo(PaymentOrder.PaymentStatus.CANCELLED);
+                    paymentOrderRepository.save(paymentOrder);
+                }
+            }
+            
+            // 记录取消日志
+            PaymentLog log = PaymentLog.info(orderNo, PaymentLog.LogOperation.PAYMENT_CANCEL, 
+                "用户主动取消支付")
+                .withContext(userId, null, null)
+                .withExecutionTime(startTime);
+            paymentLogRepository.save(log);
+            
+        } catch (Exception e) {
+            PaymentLog log = PaymentLog.error(orderNo, PaymentLog.LogOperation.PAYMENT_CANCEL, e)
+                .withContext(userId, null, null)
+                .withExecutionTime(startTime);
+            paymentLogRepository.save(log);
+            throw e;
+        }
+    }
+
+    /**
+     * 获取支付历史记录
+     * @param orderNo 订单号
+     * @return 支付日志列表
+     */
+    @Transactional(readOnly = true)
+    public List<PaymentLog> getPaymentHistory(String orderNo) {
+        return paymentLogRepository.findByOrderNoOrderByCreateTimeDesc(orderNo);
+    }
+
+    /**
+     * 检查订单是否可以支付
+     * @param orderNo 订单号
+     * @param userId 用户ID
+     * @return 检查结果
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> checkPaymentEligibility(String orderNo, Long userId) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            // 验证订单
+            Order order = orderRepository.findByOrderNo(orderNo)
+                    .orElseThrow(() -> new RuntimeException("订单不存在"));
+            
+            if (!order.getBuyerId().equals(userId)) {
+                throw new RuntimeException("无权限支付此订单");
+            }
+            
+            // 检查订单状态
+            if (order.getStatus() != Order.OrderStatus.PENDING_PAYMENT) {
+                result.put("canPay", false);
+                result.put("reason", "订单状态不允许支付：" + order.getStatus().getDescription());
+                return result;
+            }
+            
+            // 🔥 注释掉库存检查：订单创建时已经预扣库存，支付时不需要重复检查
+            // 检查库存
+            // try {
+            //     validateInventory(orderNo);
+            // } catch (Exception e) {
+            //     result.put("canPay", false);
+            //     result.put("reason", e.getMessage());
+            //     return result;
+            // }
+            
+            // 检查支付状态
+            Optional<PaymentOrder> paymentOrderOpt = paymentOrderRepository.findById(orderNo);
+            if (paymentOrderOpt.isPresent()) {
+                PaymentOrder paymentOrder = paymentOrderOpt.get();
+                if (paymentOrder.isPaid()) {
+                    result.put("canPay", false);
+                    result.put("reason", "订单已支付");
+                    return result;
+                }
+            }
+            
+            result.put("canPay", true);
+            result.put("orderAmount", order.getTotalAmount());
+            result.put("orderStatus", order.getStatus());
+            
+        } catch (Exception e) {
+            result.put("canPay", false);
+            result.put("reason", e.getMessage());
+        }
+        
+        return result;
+    }
+
+    /**
+     * 处理支付宝异步回调通知
+     * @param params 回调参数
+     * @return 处理结果
+     */
+    public String handleAlipayCallback(Map<String, String> params) {
+        long startTime = System.currentTimeMillis();
+        String orderNo = params.get("out_trade_no");
+        String alipayTradeNo = params.get("trade_no");
+        PaymentLog log = null;
+        
+        try {
+            // 1. 记录回调接收日志
+            log = PaymentLog.info(orderNo, PaymentLog.LogOperation.PAYMENT_CALLBACK, 
+                "接收到支付宝异步通知")
+                .withAlipayTradeNo(alipayTradeNo)
+                .withExecutionTime(startTime);
+            log.setRequestData(JSON.toJSONString(params));
+            paymentLogRepository.save(log);
+
+            // 2. 验证签名
+            if (!verifyAlipaySignature(params)) {
+                log = PaymentLog.error(orderNo, PaymentLog.LogOperation.SIGNATURE_VERIFY, 
+                    "支付宝回调签名验证失败")
+                    .withAlipayTradeNo(alipayTradeNo)
+                    .withExecutionTime(startTime);
+                log.setRequestData(JSON.toJSONString(params));
+                paymentLogRepository.save(log);
+                return "failure";
+            }
+
+            // 3. 幂等性检查
+            if (isCallbackProcessed(orderNo, alipayTradeNo)) {
+                log = PaymentLog.info(orderNo, PaymentLog.LogOperation.PAYMENT_CALLBACK, 
+                    "回调已处理，跳过重复处理")
+                    .withAlipayTradeNo(alipayTradeNo)
+                    .withExecutionTime(startTime);
+                paymentLogRepository.save(log);
+                return "success";
+            }
+
+            // 4. 处理支付结果
+            String tradeStatus = params.get("trade_status");
+            boolean processed = processPaymentResult(orderNo, alipayTradeNo, tradeStatus, params);
+            
+            if (processed) {
+                log = PaymentLog.info(orderNo, PaymentLog.LogOperation.PAYMENT_CALLBACK, 
+                    "支付回调处理成功，交易状态：" + tradeStatus)
+                    .withAlipayTradeNo(alipayTradeNo)
+                    .withExecutionTime(startTime);
+                log.setResponseData("处理成功");
+                paymentLogRepository.save(log);
+                return "success";
+            } else {
+                log = PaymentLog.warn(orderNo, PaymentLog.LogOperation.PAYMENT_CALLBACK, 
+                    "支付回调处理失败，交易状态：" + tradeStatus)
+                    .withAlipayTradeNo(alipayTradeNo)
+                    .withExecutionTime(startTime);
+                paymentLogRepository.save(log);
+                return "failure";
+            }
+
+        } catch (Exception e) {
+            log = PaymentLog.error(orderNo, PaymentLog.LogOperation.PAYMENT_CALLBACK, e)
+                .withAlipayTradeNo(alipayTradeNo)
+                .withExecutionTime(startTime);
+            log.setRequestData(JSON.toJSONString(params));
+            paymentLogRepository.save(log);
+            return "failure";
+        }
+    }
+
+    /**
+     * 验证支付宝回调签名
+     * @param params 回调参数
+     * @return 验证结果
+     */
+    private boolean verifyAlipaySignature(Map<String, String> params) {
+        try {
+            // 使用支付宝SDK验证签名
+            return com.alipay.api.internal.util.AlipaySignature.rsaCheckV1(
+                params, 
+                getAlipayPublicKey(), 
+                "UTF-8", 
+                "RSA2"
+            );
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * 获取支付宝公钥（从配置中获取）
+     * @return 支付宝公钥
+     */
+    private String getAlipayPublicKey() {
+        // 这里应该从配置文件或配置类中获取
+        return "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmoAMdCwoU7bxQpnEMgGD9AXDLahcT0HseNZbWNB8kEhESAvxXBX0d1Dy+SagTkp8a8c3VMCZf1sJU8txFZ42efnqglg0tP196WRG8PP5OuJGx++UdLXYFakXlVq2zVe+BWynXHGIe9Porv+R523hXoawH5oJqE0f6ztHtujNWjkGIOUJ9URCA0G84h0L0ICTY3khSo8iBttP2nUlmKrKFh556cNkBvGSbNxx6/F7K7CN5kbRX6gjw3hi9/RXG75gdz1Le0J3nfm+A1PYdqlRMs1W/Hqe8ULXSDwRT62zMiHyXReqb6UQHRkkohh01Xbo65lKLN8MkkOCe64JwCPdmQIDAQAB";
+    }
+
+    /**
+     * 检查回调是否已处理（幂等性检查）
+     * @param orderNo 订单号
+     * @param alipayTradeNo 支付宝交易号
+     * @return 是否已处理
+     */
+    private boolean isCallbackProcessed(String orderNo, String alipayTradeNo) {
+        // 检查支付订单状态
+        Optional<PaymentOrder> paymentOrderOpt = paymentOrderRepository.findById(orderNo);
+        if (paymentOrderOpt.isPresent()) {
+            PaymentOrder paymentOrder = paymentOrderOpt.get();
+            // 如果已经是已支付状态且支付宝交易号匹配，说明已处理
+            return paymentOrder.isPaid() && 
+                   alipayTradeNo.equals(paymentOrder.getAlipayTradeNo());
+        }
+        
+        // 检查是否存在相同支付宝交易号的已支付订单
+        Optional<PaymentOrder> existingOrder = paymentOrderRepository.findByAlipayTradeNo(alipayTradeNo);
+        return existingOrder.isPresent() && existingOrder.get().isPaid();
+    }
+
+    /**
+     * 处理支付结果
+     * @param orderNo 订单号
+     * @param alipayTradeNo 支付宝交易号
+     * @param tradeStatus 交易状态
+     * @param params 回调参数
+     * @return 处理结果
+     */
+    private boolean processPaymentResult(String orderNo, String alipayTradeNo, 
+                                       String tradeStatus, Map<String, String> params) {
+        try {
+            // 获取支付订单
+            PaymentOrder paymentOrder = paymentOrderRepository.findById(orderNo)
+                    .orElseThrow(() -> new RuntimeException("支付订单不存在"));
+
+            // 设置支付宝交易号
+            paymentOrder.setAlipayTradeNo(alipayTradeNo);
+            paymentOrder.setCallbackData(JSON.toJSONString(params));
+
+            // 根据交易状态处理
+            switch (tradeStatus) {
+                case "TRADE_SUCCESS":
+                case "TRADE_FINISHED":
+                    // 支付成功
+                    return handlePaymentSuccess(paymentOrder, params);
+                    
+                case "TRADE_CLOSED":
+                    // 交易关闭
+                    return handlePaymentClosed(paymentOrder, params);
+                    
+                case "WAIT_BUYER_PAY":
+                    // 等待买家付款（通常不会在异步通知中出现）
+                    return handlePaymentPending(paymentOrder, params);
+                    
+                default:
+                    // 未知状态
+                    PaymentLog.warn(orderNo, PaymentLog.LogOperation.PAYMENT_CALLBACK, 
+                        "未知的交易状态：" + tradeStatus)
+                        .withAlipayTradeNo(alipayTradeNo);
+                    return false;
+            }
+
+        } catch (Exception e) {
+            PaymentLog.error(orderNo, PaymentLog.LogOperation.PAYMENT_CALLBACK, e)
+                .withAlipayTradeNo(alipayTradeNo);
+            return false;
+        }
+    }
+
+    /**
+     * 处理支付成功
+     * @param paymentOrder 支付订单
+     * @param params 回调参数
+     * @return 处理结果
+     */
+    private boolean handlePaymentSuccess(PaymentOrder paymentOrder, Map<String, String> params) {
+        try {
+            // 更新支付订单状态
+            if (paymentOrder.canTransitionTo(PaymentOrder.PaymentStatus.PAID)) {
+                paymentOrder.transitionTo(PaymentOrder.PaymentStatus.PAID);
+                paymentOrderRepository.save(paymentOrder);
+            }
+
+            // 确认库存扣减
+            if (!inventoryService.confirmInventory(paymentOrder.getOrderNo())) {
+                PaymentLog.error(paymentOrder.getOrderNo(), PaymentLog.LogOperation.STATUS_UPDATE, 
+                    new RuntimeException("确认库存扣减失败"))
+                    .withAlipayTradeNo(paymentOrder.getAlipayTradeNo());
+                // 注意：这里不返回false，因为支付已经成功，库存确认失败需要人工处理
+            }
+
+            // 更新订单状态为待发货
+            Order order = orderRepository.findByOrderNo(paymentOrder.getOrderNo())
+                    .orElseThrow(() -> new RuntimeException("订单不存在"));
+            
+            // 🔥 修复：支付成功时，无论当前状态是什么都更新为待发货（防止超时任务已经取消了订单）
+            if (order.getStatus() == Order.OrderStatus.PENDING_PAYMENT || 
+                order.getStatus() == Order.OrderStatus.CANCELLED) {
+                order.setStatus(Order.OrderStatus.PENDING_SHIPMENT); // 支付成功后更新为待发货状态
+                orderRepository.save(order);
+                
+                // 🔥 支付成功后发布事件，取消订单超时任务
+                publishPaymentSuccessEvent(paymentOrder.getOrderNo(), paymentOrder.getAlipayTradeNo(), "TRADE_SUCCESS");
+            }
+
+            // 记录状态更新日志
+            PaymentLog.info(paymentOrder.getOrderNo(), PaymentLog.LogOperation.STATUS_UPDATE, 
+                "支付成功，订单状态已更新为待发货，超时任务已取消")
+                .withAlipayTradeNo(paymentOrder.getAlipayTradeNo());
+
+            return true;
+
+        } catch (Exception e) {
+            PaymentLog.error(paymentOrder.getOrderNo(), PaymentLog.LogOperation.STATUS_UPDATE, e)
+                .withAlipayTradeNo(paymentOrder.getAlipayTradeNo());
+            return false;
+        }
+    }
+
+    /**
+     * 处理支付关闭
+     * @param paymentOrder 支付订单
+     * @param params 回调参数
+     * @return 处理结果
+     */
+    private boolean handlePaymentClosed(PaymentOrder paymentOrder, Map<String, String> params) {
+        try {
+            // 更新支付订单状态
+            if (paymentOrder.canTransitionTo(PaymentOrder.PaymentStatus.CANCELLED)) {
+                paymentOrder.transitionTo(PaymentOrder.PaymentStatus.CANCELLED);
+                paymentOrderRepository.save(paymentOrder);
+            }
+
+            // 记录状态更新日志
+            PaymentLog.info(paymentOrder.getOrderNo(), PaymentLog.LogOperation.STATUS_UPDATE, 
+                "支付已关闭")
+                .withAlipayTradeNo(paymentOrder.getAlipayTradeNo());
+
+            return true;
+
+        } catch (Exception e) {
+            PaymentLog.error(paymentOrder.getOrderNo(), PaymentLog.LogOperation.STATUS_UPDATE, e)
+                .withAlipayTradeNo(paymentOrder.getAlipayTradeNo());
+            return false;
+        }
+    }
+
+    /**
+     * 处理支付待处理
+     * @param paymentOrder 支付订单
+     * @param params 回调参数
+     * @return 处理结果
+     */
+    private boolean handlePaymentPending(PaymentOrder paymentOrder, Map<String, String> params) {
+        try {
+            // 确保支付订单状态为待支付
+            if (paymentOrder.getStatus() != PaymentOrder.PaymentStatus.PENDING) {
+                if (paymentOrder.canTransitionTo(PaymentOrder.PaymentStatus.PENDING)) {
+                    paymentOrder.transitionTo(PaymentOrder.PaymentStatus.PENDING);
+                    paymentOrderRepository.save(paymentOrder);
+                }
+            }
+
+            // 记录状态更新日志
+            PaymentLog.info(paymentOrder.getOrderNo(), PaymentLog.LogOperation.STATUS_UPDATE, 
+                "等待买家付款")
+                .withAlipayTradeNo(paymentOrder.getAlipayTradeNo());
+
+            return true;
+
+        } catch (Exception e) {
+            PaymentLog.error(paymentOrder.getOrderNo(), PaymentLog.LogOperation.STATUS_UPDATE, e)
+                .withAlipayTradeNo(paymentOrder.getAlipayTradeNo());
+            return false;
+        }
+    }
+
+    /**
+     * 同步支付宝交易状态并更新本地状态
+     * @param orderNo 订单号
+     * @return 同步结果
+     */
+    public Map<String, Object> syncPaymentStatusFromAlipay(String orderNo) {
+        long startTime = System.currentTimeMillis();
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            // 查询支付宝交易状态
+            AlipayTradeQueryResponse response = queryAlipayTradeStatus(orderNo);
+            
+            if (!response.isSuccess()) {
+                result.put("success", false);
+                result.put("message", "查询支付宝交易状态失败：" + response.getSubMsg());
+                return result;
+            }
+
+            // 获取本地支付订单
+            Optional<PaymentOrder> paymentOrderOpt = paymentOrderRepository.findById(orderNo);
+            if (paymentOrderOpt.isEmpty()) {
+                result.put("success", false);
+                result.put("message", "本地支付订单不存在");
+                return result;
+            }
+
+            PaymentOrder paymentOrder = paymentOrderOpt.get();
+            String alipayTradeStatus = response.getTradeStatus();
+            
+            // 更新支付宝交易号
+            if (response.getTradeNo() != null && !response.getTradeNo().equals(paymentOrder.getAlipayTradeNo())) {
+                paymentOrder.setAlipayTradeNo(response.getTradeNo());
+            }
+
+            // 根据支付宝状态更新本地状态
+            boolean statusUpdated = false;
+            PaymentOrder.PaymentStatus newStatus = null;
+
+            switch (alipayTradeStatus) {
+                case "TRADE_SUCCESS":
+                case "TRADE_FINISHED":
+                    if (!paymentOrder.isPaid()) {
+                        newStatus = PaymentOrder.PaymentStatus.PAID;
+                        statusUpdated = true;
+                    }
+                    break;
+                    
+                case "TRADE_CLOSED":
+                    if (paymentOrder.getStatus() != PaymentOrder.PaymentStatus.CANCELLED) {
+                        newStatus = PaymentOrder.PaymentStatus.CANCELLED;
+                        statusUpdated = true;
+                    }
+                    break;
+                    
+                case "WAIT_BUYER_PAY":
+                    if (paymentOrder.getStatus() != PaymentOrder.PaymentStatus.PENDING) {
+                        newStatus = PaymentOrder.PaymentStatus.PENDING;
+                        statusUpdated = true;
+                    }
+                    break;
+            }
+
+            // 更新状态
+            if (statusUpdated && newStatus != null) {
+                if (paymentOrder.canTransitionTo(newStatus)) {
+                    paymentOrder.transitionTo(newStatus);
+                    paymentOrderRepository.save(paymentOrder);
+                    
+                    // 如果支付成功，同时更新订单状态
+                    if (newStatus == PaymentOrder.PaymentStatus.PAID) {
+                        updateOrderStatusAfterPayment(orderNo);
+                    }
+                    
+                    // 记录同步日志
+                    PaymentLog.info(orderNo, PaymentLog.LogOperation.STATUS_UPDATE, 
+                        "从支付宝同步状态成功：" + alipayTradeStatus + " -> " + newStatus)
+                        .withAlipayTradeNo(paymentOrder.getAlipayTradeNo())
+                        .withExecutionTime(startTime);
+                }
+            }
+
+            result.put("success", true);
+            result.put("alipayStatus", alipayTradeStatus);
+            result.put("localStatus", paymentOrder.getStatus());
+            result.put("statusUpdated", statusUpdated);
+            result.put("paymentOrder", paymentOrder);
+            
+            return result;
+
+        } catch (Exception e) {
+            PaymentLog.error(orderNo, PaymentLog.LogOperation.PAYMENT_QUERY, e)
+                .withExecutionTime(startTime);
+            
+            result.put("success", false);
+            result.put("message", "同步支付状态失败：" + e.getMessage());
+            return result;
+        }
+    }
+
+    /**
+     * 支付成功后更新订单状态
+     * @param orderNo 订单号
+     */
+    private void updateOrderStatusAfterPayment(String orderNo) {
+        try {
+            // 确认库存扣减
+            if (!inventoryService.confirmInventory(orderNo)) {
+                PaymentLog.error(orderNo, PaymentLog.LogOperation.ORDER_UPDATE, 
+                    new RuntimeException("确认库存扣减失败"));
+            }
+
+            Order order = orderRepository.findByOrderNo(orderNo)
+                    .orElseThrow(() -> new RuntimeException("订单不存在"));
+            
+            if (order.getStatus() == Order.OrderStatus.PENDING_PAYMENT) {
+                order.setStatus(Order.OrderStatus.PENDING_SHIPMENT); // 支付成功后改为待发货状态
+                orderRepository.save(order);
+                
+                PaymentLog.info(orderNo, PaymentLog.LogOperation.ORDER_UPDATE, 
+                    "支付成功后订单状态已更新为待发货");
+            }
+        } catch (Exception e) {
+            PaymentLog.error(orderNo, PaymentLog.LogOperation.ORDER_UPDATE, e);
+        }
+    }
+
+    /**
+     * 获取详细的支付状态信息
+     * @param orderNo 订单号
+     * @return 支付状态详情
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> getDetailedPaymentStatus(String orderNo) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            // 获取订单信息
+            Order order = orderRepository.findByOrderNo(orderNo)
+                    .orElseThrow(() -> new RuntimeException("订单不存在"));
+            
+            // 获取支付订单信息
+            Optional<PaymentOrder> paymentOrderOpt = paymentOrderRepository.findById(orderNo);
+            
+            // 获取支付历史记录
+            List<PaymentLog> paymentHistory = paymentLogRepository.findByOrderNoOrderByCreateTimeDesc(orderNo);
+            
+            result.put("order", order);
+            result.put("paymentOrder", paymentOrderOpt.orElse(null));
+            result.put("paymentHistory", paymentHistory);
+            result.put("hasPaymentOrder", paymentOrderOpt.isPresent());
+            
+            if (paymentOrderOpt.isPresent()) {
+                PaymentOrder paymentOrder = paymentOrderOpt.get();
+                result.put("isPaid", paymentOrder.isPaid());
+                result.put("canCancel", paymentOrder.canCancel());
+                result.put("isTimeout", paymentOrder.isTimeout());
+                result.put("paymentStatus", paymentOrder.getStatus());
+                result.put("paymentAmount", paymentOrder.getAmount());
+                result.put("alipayTradeNo", paymentOrder.getAlipayTradeNo());
+                result.put("createTime", paymentOrder.getCreateTime());
+                result.put("payTime", paymentOrder.getPayTime());
+            }
+            
+            return result;
+            
+        } catch (Exception e) {
+            result.put("error", e.getMessage());
+            return result;
+        }
+    }
+
+    /**
+     * 获取用户的支付订单列表
+     * @param userId 用户ID
+     * @return 支付订单列表
+     */
+    @Transactional(readOnly = true)
+    public List<PaymentOrder> getUserPaymentOrders(Long userId) {
+        return paymentOrderRepository.findByBuyerIdOrderByCreateTimeDesc(userId);
+    }
+
+    /**
+     * 获取用户指定状态的支付订单列表
+     * @param userId 用户ID
+     * @param status 支付状态
+     * @return 支付订单列表
+     */
+    @Transactional(readOnly = true)
+    public List<PaymentOrder> getUserPaymentOrdersByStatus(Long userId, PaymentOrder.PaymentStatus status) {
+        return paymentOrderRepository.findByBuyerIdAndStatusOrderByCreateTimeDesc(userId, status);
+    }
+
+    /**
+     * 批量查询支付状态
+     * @param orderNos 订单号列表
+     * @return 支付状态映射
+     */
+    @Transactional(readOnly = true)
+    public Map<String, PaymentOrder.PaymentStatus> batchGetPaymentStatus(List<String> orderNos) {
+        Map<String, PaymentOrder.PaymentStatus> statusMap = new HashMap<>();
+        
+        for (String orderNo : orderNos) {
+            Optional<PaymentOrder> paymentOrder = paymentOrderRepository.findById(orderNo);
+            if (paymentOrder.isPresent()) {
+                statusMap.put(orderNo, paymentOrder.get().getStatus());
+            } else {
+                statusMap.put(orderNo, null); // 未创建支付订单
+            }
+        }
+        
+        return statusMap;
+    }
+
+    /**
+     * 检查支付订单是否超时
+     * @param orderNo 订单号
+     * @return 超时检查结果
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> checkPaymentTimeout(String orderNo) {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            Optional<PaymentOrder> paymentOrderOpt = paymentOrderRepository.findById(orderNo);
+            
+            if (paymentOrderOpt.isEmpty()) {
+                result.put("exists", false);
+                result.put("message", "支付订单不存在");
+                return result;
+            }
+            
+            PaymentOrder paymentOrder = paymentOrderOpt.get();
+            boolean isTimeout = paymentOrder.isTimeout();
+            
+            result.put("exists", true);
+            result.put("isTimeout", isTimeout);
+            result.put("status", paymentOrder.getStatus());
+            result.put("createTime", paymentOrder.getCreateTime());
+            result.put("timeoutExpress", paymentOrder.getTimeoutExpress());
+            
+            if (isTimeout && paymentOrder.getStatus() == PaymentOrder.PaymentStatus.PENDING) {
+                result.put("canMarkTimeout", true);
+                result.put("message", "支付订单已超时，可以标记为超时状态");
+            } else {
+                result.put("canMarkTimeout", false);
+            }
+            
+            return result;
+            
+        } catch (Exception e) {
+            result.put("error", e.getMessage());
+            return result;
+        }
+    }
+
+    /**
+     * 处理支付超时
+     * 由超时任务调度器调用
+     * @param orderNo 订单号
+     * @return 处理结果
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public boolean handlePaymentTimeout(String orderNo) {
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            // 查询支付订单
+            Optional<PaymentOrder> paymentOrderOpt = paymentOrderRepository.findById(orderNo);
+            if (paymentOrderOpt.isEmpty()) {
+                PaymentLog.warn(orderNo, PaymentLog.LogOperation.TIMEOUT_HANDLE, 
+                    "处理支付超时时支付订单不存在")
+                    .withExecutionTime(startTime);
+                return false;
+            }
+
+            PaymentOrder paymentOrder = paymentOrderOpt.get();
+            
+            // 检查支付状态，如果已支付则不需要处理
+            if (paymentOrder.isPaid()) {
+                PaymentLog.info(orderNo, PaymentLog.LogOperation.TIMEOUT_HANDLE, 
+                    "支付订单已支付，跳过超时处理")
+                    .withAlipayTradeNo(paymentOrder.getAlipayTradeNo())
+                    .withExecutionTime(startTime);
+                return true;
+            }
+
+            // 主动查询支付宝交易状态
+            try {
+                AlipayTradeQueryResponse response = queryAlipayTradeStatus(orderNo);
+                if (response.isSuccess()) {
+                    String tradeStatus = response.getTradeStatus();
+                    
+                    // 如果支付宝显示已支付，更新本地状态
+                    if ("TRADE_SUCCESS".equals(tradeStatus) || "TRADE_FINISHED".equals(tradeStatus)) {
+                        Map<String, String> params = new HashMap<>();
+                        params.put("out_trade_no", orderNo);
+                        params.put("trade_no", response.getTradeNo());
+                        params.put("trade_status", tradeStatus);
+                        
+                        boolean processed = processPaymentResult(orderNo, response.getTradeNo(), tradeStatus, params);
+                        
+                        PaymentLog.info(orderNo, PaymentLog.LogOperation.TIMEOUT_HANDLE, 
+                            "超时处理时发现支付已完成，状态已同步")
+                            .withAlipayTradeNo(response.getTradeNo())
+                            .withExecutionTime(startTime);
+                        
+                        return processed;
+                    }
+                }
+            } catch (Exception e) {
+                PaymentLog.warn(orderNo, PaymentLog.LogOperation.TIMEOUT_HANDLE, 
+                    "查询支付宝交易状态失败：" + e.getMessage())
+                    .withExecutionTime(startTime);
+            }
+
+            // 如果确实超时且未支付，标记为超时状态
+            if (paymentOrder.isTimeout() && paymentOrder.getStatus() == PaymentOrder.PaymentStatus.PENDING) {
+                if (paymentOrder.canTransitionTo(PaymentOrder.PaymentStatus.TIMEOUT)) {
+                    paymentOrder.transitionTo(PaymentOrder.PaymentStatus.TIMEOUT);
+                    paymentOrderRepository.save(paymentOrder);
+                    
+                    PaymentLog.info(orderNo, PaymentLog.LogOperation.TIMEOUT_HANDLE, 
+                        "支付订单已标记为超时状态")
+                        .withExecutionTime(startTime);
+                }
+            }
+
+            return true;
+
+        } catch (Exception e) {
+            PaymentLog.error(orderNo, PaymentLog.LogOperation.TIMEOUT_HANDLE, e)
+                .withExecutionTime(startTime);
+            return false;
+        }
+    }
+
+    /**
+     * 处理回调超时
+     * 当支付回调长时间未收到时，主动查询支付状态
+     * @param orderNo 订单号
+     * @return 处理结果
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public boolean handleCallbackTimeout(String orderNo) {
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            // 查询支付订单
+            Optional<PaymentOrder> paymentOrderOpt = paymentOrderRepository.findById(orderNo);
+            if (paymentOrderOpt.isEmpty()) {
+                PaymentLog.warn(orderNo, PaymentLog.LogOperation.CALLBACK_TIMEOUT, 
+                    "处理回调超时时支付订单不存在")
+                    .withExecutionTime(startTime);
+                return false;
+            }
+
+            PaymentOrder paymentOrder = paymentOrderOpt.get();
+            
+            // 如果已经有明确状态，不需要处理
+            if (paymentOrder.getStatus() != PaymentOrder.PaymentStatus.PENDING) {
+                PaymentLog.info(orderNo, PaymentLog.LogOperation.CALLBACK_TIMEOUT, 
+                    "支付订单状态已确定，跳过回调超时处理：" + paymentOrder.getStatus())
+                    .withAlipayTradeNo(paymentOrder.getAlipayTradeNo())
+                    .withExecutionTime(startTime);
+                return true;
+            }
+
+            // 主动查询支付宝交易状态
+            try {
+                Map<String, Object> syncResult = syncPaymentStatusFromAlipay(orderNo);
+                boolean success = (Boolean) syncResult.getOrDefault("success", false);
+                
+                if (success) {
+                    PaymentLog.info(orderNo, PaymentLog.LogOperation.CALLBACK_TIMEOUT, 
+                        "回调超时处理完成，状态已同步：" + syncResult.get("localStatus"))
+                        .withExecutionTime(startTime);
+                    return true;
+                } else {
+                    PaymentLog.warn(orderNo, PaymentLog.LogOperation.CALLBACK_TIMEOUT, 
+                        "回调超时处理失败：" + syncResult.get("message"))
+                        .withExecutionTime(startTime);
+                    return false;
+                }
+                
+            } catch (Exception e) {
+                PaymentLog.error(orderNo, PaymentLog.LogOperation.CALLBACK_TIMEOUT, e)
+                    .withExecutionTime(startTime);
+                return false;
+            }
+
+        } catch (Exception e) {
+            PaymentLog.error(orderNo, PaymentLog.LogOperation.CALLBACK_TIMEOUT, e)
+                .withExecutionTime(startTime);
+            return false;
+        }
+    }
+}
